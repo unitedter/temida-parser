@@ -9,7 +9,6 @@ from urllib.parse import urlparse, urlunparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# ---------- авто-установка flagz ----------
 def _ensure_pip():
     try:
         __import__("flagz")
@@ -25,7 +24,6 @@ except ImportError:
     HAS_FLAGZ = False
 
 
-# ---------- настройки ----------
 SOURCES = [
     "https://raw.githubusercontent.com/igctndd-hub/LikeVPN/refs/heads/main/LikeVPN.txt",
     "https://raw.githubusercontent.com/topgee-lab/topgee17/refs/heads/main/parsing",
@@ -50,7 +48,6 @@ FLAG_RE      = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
 B64_BLOCK_RE = re.compile(r"base64:([A-Za-z0-9+/=]+)")
 
 
-# ---------- URL-энкодинг (пробелы, эмодзи, кириллица) ----------
 def _encode_url(url: str) -> str:
     p = urlparse(url)
     return urlunparse((
@@ -62,7 +59,6 @@ def _encode_url(url: str) -> str:
     ))
 
 
-# ---------- загрузка ----------
 def fetch_url(url: str):
     safe = _encode_url(url)
     try:
@@ -78,7 +74,6 @@ def fetch_url(url: str):
         return None
 
 
-# ---------- base64 ----------
 def _fix_b64(s):
     s = s.strip().replace("\n", "").replace("\r", "")
     m = len(s) % 4
@@ -96,10 +91,10 @@ def _try_b64(text):
         return None
 
 
-# ---------- Xray-JSON (LikeVPN.txt и подобные) ----------
 def _parse_xray_json(text):
     uris = []
-    for m in re.finditer(r'"outbounds"\s*:\s*(\[.*?\])\s*[,}]", text, re.DOTALL):
+    # ⚠ ИСПРАВЛЕНО: закрывающая ' после "  (было `[,}]"` — открывало неопределённую строку)
+    for m in re.finditer(r'"outbounds"\s*:\s*(\[.*?\])\s*[,}]', text, re.DOTALL):
         try:
             obs = json.loads(m.group(1))
         except json.JSONDecodeError:
@@ -159,7 +154,6 @@ def extract_uris(text):
     return uris
 
 
-# ---------- URI -> outbound ----------
 def _parse_vless(uri):
     u = urlparse(uri); q = parse_qs(u.query)
     uid  = unquote(u.username or "")
@@ -271,7 +265,6 @@ def uri_to_outbound(uri):
     return None
 
 
-# ---------- Xray ----------
 def ensure_xray(root: Path):
     xray_dir = root / "xray"
     xray_bin = xray_dir / "xray"
@@ -326,7 +319,7 @@ def test_one(xray_bin, xray_dir, outbound, timeout_ms):
         started = False
         while time.time() < deadline:
             if proc.poll() is not None:
-                return None          # xray упал — конфиг мёртвый
+                return None
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                     started = True
@@ -368,7 +361,6 @@ def test_one(xray_bin, xray_dir, outbound, timeout_ms):
             pass
 
 
-# ---------- флаги ----------
 def extract_flag(t):
     m = FLAG_RE.search(t or "")
     return m.group(0) if m else None
@@ -392,7 +384,6 @@ def rename_config(uri, idx):
     return f"{uri.split('#', 1)[0]}#{name}"
 
 
-# ---------- main ----------
 def main():
     root = Path("./")
     xray_bin, xray_dir = ensure_xray(root)
