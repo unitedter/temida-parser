@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Temida Parser — сбор, реальный замер пинга и гео-флагов конфигов."""
+"""Temida Parser — строгая проверка конфигов с реальным TLS и повтором."""
 
 import os, io, re, sys, json, time, base64, socket, zipfile, tempfile, subprocess
 from pathlib import Path
@@ -9,7 +9,6 @@ from urllib.parse import urlparse, urlunparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# ---------- flagz (необязательный, для англ. фолбэка) ----------
 def _ensure_pip():
     try:
         __import__("flagz")
@@ -25,7 +24,6 @@ except ImportError:
     HAS_FLAGZ = False
 
 
-# ---------- настройки ----------
 SOURCES = [
     "https://raw.githubusercontent.com/igctndd-hub/LikeVPN/refs/heads/main/LikeVPN.txt",
     "https://raw.githubusercontent.com/topgee-lab/topgee17/refs/heads/main/parsing",
@@ -39,281 +37,80 @@ SOURCES = [
 ]
 
 OUTPUT_FILE        = "temida.txt"
-TEST_URL           = "http://www.gstatic.com/generate_204"
-REQUEST_TIMEOUT_MS = 3000
-PING_LIMIT_MS      = 250
-PING_ATTEMPTS      = 2
+TEST_URL           = "https://www.gstatic.com/generate_204"  # HTTPS — TLS проверяется
+REQUEST_TIMEOUT_MS = 4000
+PING_LIMIT_MS      = 400        # ← расширено с 250
+PING_ATTEMPTS      = 3          # 3 попытки
+MIN_SUCCESS        = 2          # из них минимум 2 успешных
+STABILITY_WAIT     = 2.0        # пауза перед контрольным повтором
 TCP_CHECK_TIMEOUT  = 3.0
-WORKERS            = 20
+WORKERS            = 15
 FETCH_TIMEOUT      = 30
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
 
-URI_RE       = re.compile(r"^(vless|vmess|trojan)://", re.I)
+URI_RE       = re.compile(r"^(vless|vmess|trojan|ss)://", re.I)
 FLAG_RE      = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
 B64_BLOCK_RE = re.compile(r"base64:([A-Za-z0-9+/=]+)")
 
 
-# ============================================================
-#  ПОЛНЫЙ СЛОВАРЬ СТРАН (ISO 3166-1 alpha-2 → русское название)
-# ============================================================
-
 RU_COUNTRIES = {
-    "AD": "Андорра",
-    "AE": "ОАЭ",
-    "AF": "Афганистан",
-    "AG": "Антигуа и Барбуда",
-    "AI": "Ангилья",
-    "AL": "Албания",
-    "AM": "Армения",
-    "AO": "Ангола",
-    "AQ": "Антарктида",
-    "AR": "Аргентина",
-    "AS": "Американское Самоа",
-    "AT": "Австрия",
-    "AU": "Австралия",
-    "AW": "Аруба",
-    "AX": "Аландские острова",
-    "AZ": "Азербайджан",
-    "BA": "Босния и Герцеговина",
-    "BB": "Барбадос",
-    "BD": "Бангладеш",
-    "BE": "Бельгия",
-    "BF": "Буркина-Фасо",
-    "BG": "Болгария",
-    "BH": "Бахрейн",
-    "BI": "Бурунди",
-    "BJ": "Бенин",
-    "BL": "Сен-Бартелеми",
-    "BM": "Бермуды",
-    "BN": "Бруней",
-    "BO": "Боливия",
-    "BQ": "Бонайре",
-    "BR": "Бразилия",
-    "BS": "Багамы",
-    "BT": "Бутан",
-    "BV": "Остров Буве",
-    "BW": "Ботсвана",
-    "BY": "Беларусь",
-    "BZ": "Белиз",
-    "CA": "Канада",
-    "CC": "Кокосовые острова",
-    "CD": "Конго (ДРК)",
-    "CF": "ЦАР",
-    "CG": "Конго",
-    "CH": "Швейцария",
-    "CI": "Кот-д’Ивуар",
-    "CK": "Острова Кука",
-    "CL": "Чили",
-    "CM": "Камерун",
-    "CN": "Китай",
-    "CO": "Колумбия",
-    "CR": "Коста-Рика",
-    "CU": "Куба",
-    "CV": "Кабо-Верде",
-    "CW": "Кюрасао",
-    "CX": "Остров Рождества",
-    "CY": "Кипр",
-    "CZ": "Чехия",
-    "DE": "Германия",
-    "DJ": "Джибути",
-    "DK": "Дания",
-    "DM": "Доминика",
-    "DO": "Доминикана",
-    "DZ": "Алжир",
-    "EC": "Эквадор",
-    "EE": "Эстония",
-    "EG": "Египет",
-    "EH": "Западная Сахара",
-    "ER": "Эритрея",
-    "ES": "Испания",
-    "ET": "Эфиопия",
-    "FI": "Финляндия",
-    "FJ": "Фиджи",
-    "FK": "Фолкленды",
-    "FM": "Микронезия",
-    "FO": "Фареры",
-    "FR": "Франция",
-    "GA": "Габон",
-    "GB": "Великобритания",
-    "GD": "Гренада",
-    "GE": "Грузия",
-    "GF": "Французская Гвиана",
-    "GG": "Гернси",
-    "GH": "Гана",
-    "GI": "Гибралтар",
-    "GL": "Гренландия",
-    "GM": "Гамбия",
-    "GN": "Гвинея",
-    "GP": "Гваделупа",
-    "GQ": "Экваториальная Гвинея",
-    "GR": "Греция",
-    "GS": "Южная Георгия",
-    "GT": "Гватемала",
-    "GU": "Гуам",
-    "GW": "Гвинея-Бисау",
-    "GY": "Гайана",
-    "HK": "Гонконг",
-    "HM": "Остров Херд",
-    "HN": "Гондурас",
-    "HR": "Хорватия",
-    "HT": "Гаити",
-    "HU": "Венгрия",
-    "ID": "Индонезия",
-    "IE": "Ирландия",
-    "IL": "Израиль",
-    "IM": "Остров Мэн",
-    "IN": "Индия",
-    "IO": "Британская территория в Индийском океане",
-    "IQ": "Ирак",
-    "IR": "Иран",
-    "IS": "Исландия",
-    "IT": "Италия",
-    "JE": "Джерси",
-    "JM": "Ямайка",
-    "JO": "Иордания",
-    "JP": "Япония",
-    "KE": "Кения",
-    "KG": "Кыргызстан",
-    "KH": "Камбоджа",
-    "KI": "Кирибати",
-    "KM": "Коморы",
-    "KN": "Сент-Китс и Невис",
-    "KP": "КНДР",
-    "KR": "Южная Корея",
-    "KW": "Кувейт",
-    "KY": "Каймановы острова",
-    "KZ": "Казахстан",
-    "LA": "Лаос",
-    "LB": "Ливан",
-    "LC": "Сент-Люсия",
-    "LI": "Лихтенштейн",
-    "LK": "Шри-Ланка",
-    "LR": "Либерия",
-    "LS": "Лесото",
-    "LT": "Литва",
-    "LU": "Люксембург",
-    "LV": "Латвия",
-    "LY": "Ливия",
-    "MA": "Марокко",
-    "MC": "Монако",
-    "MD": "Молдова",
-    "ME": "Черногория",
-    "MF": "Сен-Мартен",
-    "MG": "Мадагаскар",
-    "MH": "Маршалловы Острова",
-    "MK": "Северная Македония",
-    "ML": "Мали",
-    "MM": "Мьянма",
-    "MN": "Монголия",
-    "MO": "Макао",
-    "MP": "Северные Марианские острова",
-    "MQ": "Мартиника",
-    "MR": "Мавритания",
-    "MS": "Монтсеррат",
-    "MT": "Мальта",
-    "MU": "Маврикий",
-    "MV": "Мальдивы",
-    "MW": "Малави",
-    "MX": "Мексика",
-    "MY": "Малайзия",
-    "MZ": "Мозамбик",
-    "NA": "Намибия",
-    "NC": "Новая Каледония",
-    "NE": "Нигер",
-    "NF": "Остров Норфолк",
-    "NG": "Нигерия",
-    "NI": "Никарагуа",
-    "NL": "Нидерланды",
-    "NO": "Норвегия",
-    "NP": "Непал",
-    "NR": "Науру",
-    "NU": "Ниуэ",
-    "NZ": "Новая Зеландия",
-    "OM": "Оман",
-    "PA": "Панама",
-    "PE": "Перу",
-    "PF": "Французская Полинезия",
-    "PG": "Папуа — Новая Гвинея",
-    "PH": "Филиппины",
-    "PK": "Пакистан",
-    "PL": "Польша",
-    "PM": "Сен-Пьер и Микелон",
-    "PN": "Питкэрн",
-    "PR": "Пуэрто-Рико",
-    "PS": "Палестина",
-    "PT": "Португалия",
-    "PW": "Палау",
-    "PY": "Парагвай",
-    "QA": "Катар",
-    "RE": "Реюньон",
-    "RO": "Румыния",
-    "RS": "Сербия",
-    "RU": "Россия",
-    "RW": "Руанда",
-    "SA": "Саудовская Аравия",
-    "SB": "Соломоновы Острова",
-    "SC": "Сейшелы",
-    "SD": "Судан",
-    "SE": "Швеция",
-    "SG": "Сингапур",
-    "SH": "Остров Святой Елены",
-    "SI": "Словения",
-    "SJ": "Шпицберген и Ян-Майен",
-    "SK": "Словакия",
-    "SL": "Сьерра-Леоне",
-    "SM": "Сан-Марино",
-    "SN": "Сенегал",
-    "SO": "Сомали",
-    "SR": "Суринам",
-    "SS": "Южный Судан",
-    "ST": "Сан-Томе и Принсипи",
-    "SV": "Сальвадор",
-    "SX": "Синт-Мартен",
-    "SY": "Сирия",
-    "SZ": "Эсватини",
-    "TC": "Тёркс и Кайкос",
-    "TD": "Чад",
-    "TF": "Французские Южные территории",
-    "TG": "Того",
-    "TH": "Таиланд",
-    "TJ": "Таджикистан",
-    "TK": "Токелау",
-    "TL": "Восточный Тимор",
-    "TM": "Туркменистан",
-    "TN": "Тунис",
-    "TO": "Тонга",
-    "TR": "Турция",
-    "TT": "Тринидад и Тобаго",
-    "TV": "Тувалу",
-    "TW": "Тайвань",
-    "TZ": "Танзания",
-    "UA": "Украина",
-    "UG": "Уганда",
-    "UM": "Внешние малые острова США",
-    "US": "США",
-    "UY": "Уругвай",
-    "UZ": "Узбекистан",
-    "VA": "Ватикан",
-    "VC": "Сент-Винсент и Гренадины",
-    "VE": "Венесуэла",
-    "VG": "Британские Виргинские острова",
-    "VI": "Виргинские Острова США",
-    "VN": "Вьетнам",
-    "VU": "Вануату",
-    "WF": "Уоллис и Футуна",
-    "WS": "Самоа",
-    "XK": "Косово",
-    "YE": "Йемен",
-    "YT": "Майотта",
-    "ZA": "ЮАР",
-    "ZM": "Замбия",
-    "ZW": "Зимбабве",
+    "AD":"Андорра","AE":"ОАЭ","AF":"Афганистан","AG":"Антигуа и Барбуда","AI":"Ангилья",
+    "AL":"Албания","AM":"Армения","AO":"Ангола","AQ":"Антарктида","AR":"Аргентина",
+    "AS":"Американское Самоа","AT":"Австрия","AU":"Австралия","AW":"Аруба",
+    "AX":"Аландские острова","AZ":"Азербайджан","BA":"Босния и Герцеговина",
+    "BB":"Барбадос","BD":"Бангладеш","BE":"Бельгия","BF":"Буркина-Фасо","BG":"Болгария",
+    "BH":"Бахрейн","BI":"Бурунди","BJ":"Бенин","BL":"Сен-Бартелеми","BM":"Бермуды",
+    "BN":"Бруней","BO":"Боливия","BQ":"Бонайре","BR":"Бразилия","BS":"Багамы",
+    "BT":"Бутан","BV":"Остров Буве","BW":"Ботсвана","BY":"Беларусь","BZ":"Белиз",
+    "CA":"Канада","CC":"Кокосовые острова","CD":"Конго (ДРК)","CF":"ЦАР","CG":"Конго",
+    "CH":"Швейцария","CI":"Кот-д’Ивуар","CK":"Острова Кука","CL":"Чили","CM":"Камерун",
+    "CN":"Китай","CO":"Колумбия","CR":"Коста-Рика","CU":"Куба","CV":"Кабо-Верде",
+    "CW":"Кюрасао","CX":"Остров Рождества","CY":"Кипр","CZ":"Чехия","DE":"Германия",
+    "DJ":"Джибути","DK":"Дания","DM":"Доминика","DO":"Доминикана","DZ":"Алжир",
+    "EC":"Эквадор","EE":"Эстония","EG":"Египет","EH":"Западная Сахара","ER":"Эритрея",
+    "ES":"Испания","ET":"Эфиопия","FI":"Финляндия","FJ":"Фиджи","FK":"Фолкленды",
+    "FM":"Микронезия","FO":"Фареры","FR":"Франция","GA":"Габон","GB":"Великобритания",
+    "GD":"Гренада","GE":"Грузия","GF":"Французская Гвиана","GG":"Гернси","GH":"Гана",
+    "GI":"Гибралтар","GL":"Гренландия","GM":"Гамбия","GN":"Гвинея","GP":"Гваделупа",
+    "GQ":"Экваториальная Гвинея","GR":"Греция","GS":"Южная Георгия","GT":"Гватемала",
+    "GU":"Гуам","GW":"Гвинея-Бисау","GY":"Гайана","HK":"Гонконг","HM":"Остров Херд",
+    "HN":"Гондурас","HR":"Хорватия","HT":"Гаити","HU":"Венгрия","ID":"Индонезия",
+    "IE":"Ирландия","IL":"Израиль","IM":"Остров Мэн","IN":"Индия",
+    "IO":"Британская территория в Индийском океане","IQ":"Ирак","IR":"Иран",
+    "IS":"Исландия","IT":"Италия","JE":"Джерси","JM":"Ямайка","JO":"Иордания",
+    "JP":"Япония","KE":"Кения","KG":"Кыргызстан","KH":"Камбоджа","KI":"Кирибати",
+    "KM":"Коморы","KN":"Сент-Китс и Невис","KP":"КНДР","KR":"Южная Корея","KW":"Кувейт",
+    "KY":"Каймановы острова","KZ":"Казахстан","LA":"Лаос","LB":"Ливан","LC":"Сент-Люсия",
+    "LI":"Лихтенштейн","LK":"Шри-Ланка","LR":"Либерия","LS":"Лесото","LT":"Литва",
+    "LU":"Люксембург","LV":"Латвия","LY":"Ливия","MA":"Марокко","MC":"Монако",
+    "MD":"Молдова","ME":"Черногория","MF":"Сен-Мартен","MG":"Мадагаскар",
+    "MH":"Маршалловы Острова","MK":"Северная Македония","ML":"Мали","MM":"Мьянма",
+    "MN":"Монголия","MO":"Макао","MP":"Северные Марианские острова","MQ":"Мартиника",
+    "MR":"Мавритания","MS":"Монтсеррат","MT":"Мальта","MU":"Маврикий","MV":"Мальдивы",
+    "MW":"Малави","MX":"Мексика","MY":"Малайзия","MZ":"Мозамбик","NA":"Намибия",
+    "NC":"Новая Каледония","NE":"Нигер","NF":"Остров Норфолк","NG":"Нигерия",
+    "NI":"Никарагуа","NL":"Нидерланды","NO":"Норвегия","NP":"Непал","NR":"Науру",
+    "NU":"Ниуэ","NZ":"Новая Зеландия","OM":"Оман","PA":"Панама","PE":"Перу",
+    "PF":"Французская Полинезия","PG":"Папуа — Новая Гвинея","PH":"Филиппины",
+    "PK":"Пакистан","PL":"Польша","PM":"Сен-Пьер и Микелон","PN":"Питкэрн",
+    "PR":"Пуэрто-Рико","PS":"Палестина","PT":"Португалия","PW":"Палау","PY":"Парагвай",
+    "QA":"Катар","RE":"Реюньон","RO":"Румыния","RS":"Сербия","RU":"Россия","RW":"Руанда",
+    "SA":"Саудовская Аравия","SB":"Соломоновы Острова","SC":"Сейшелы","SD":"Судан",
+    "SE":"Швеция","SG":"Сингапур","SH":"Остров Святой Елены","SI":"Словения",
+    "SJ":"Шпицберген и Ян-Майен","SK":"Словакия","SL":"Сьерра-Леоне","SM":"Сан-Марино",
+    "SN":"Сенегал","SO":"Сомали","SR":"Суринам","SS":"Южный Судан",
+    "ST":"Сан-Томе и Принсипи","SV":"Сальвадор","SX":"Синт-Мартен","SY":"Сирия",
+    "SZ":"Эсватини","TC":"Тёркс и Кайкос","TD":"Чад",
+    "TF":"Французские Южные территории","TG":"Того","TH":"Таиланд","TJ":"Таджикистан",
+    "TK":"Токелау","TL":"Восточный Тимор","TM":"Туркменистан","TN":"Тунис","TO":"Тонга",
+    "TR":"Турция","TT":"Тринидад и Тобаго","TV":"Тувалу","TW":"Тайвань","TZ":"Танзания",
+    "UA":"Украина","UG":"Уганда","UM":"Внешние малые острова США","US":"США",
+    "UY":"Уругвай","UZ":"Узбекистан","VA":"Ватикан","VC":"Сент-Винсент и Гренадины",
+    "VE":"Венесуэла","VG":"Британские Виргинские острова","VI":"Виргинские Острова США",
+    "VN":"Вьетнам","VU":"Вануату","WF":"Уоллис и Футуна","WS":"Самоа","XK":"Косово",
+    "YE":"Йемен","YT":"Майотта","ZA":"ЮАР","ZM":"Замбия","ZW":"Зимбабве",
 }
 
-
-# ============================================================
-#  ФЛАГИ И НАЗВАНИЯ
-# ============================================================
 
 def code_to_flag(code):
     if not code or len(code) != 2:
@@ -322,11 +119,9 @@ def code_to_flag(code):
 
 
 def country_info(code):
-    """'BY' → ('🇧🇾', 'Беларусь'). Фолбэки: словарь → flagz → код."""
     code = (code or "").upper()
     if len(code) != 2 or not code.isalpha():
         return "\U0001F310", "Unknown"
-
     flag = code_to_flag(code)
     name = RU_COUNTRIES.get(code)
     if name:
@@ -338,10 +133,6 @@ def country_info(code):
             pass
     return flag, code
 
-
-# ============================================================
-#  URL-энкодинг и загрузка
-# ============================================================
 
 def _encode_url(url: str) -> str:
     p = urlparse(url)
@@ -368,10 +159,6 @@ def fetch_url(url: str):
         print(f"[ERROR] {url[:60]}... -> {e}", file=sys.stderr)
         return None
 
-
-# ============================================================
-#  Base64 / Xray-JSON / URI-парсеры
-# ============================================================
 
 def _fix_b64(s):
     s = s.strip().replace("\n", "").replace("\r", "")
@@ -401,15 +188,12 @@ def _parse_xray_json(text):
             if ob.get("protocol") not in ("vless", "vmess", "trojan"):
                 continue
             try:
-                vnext  = ob["settings"]["vnext"][0]
-                addr   = vnext["address"]
-                port   = vnext["port"]
-                user   = vnext["users"][0]
-                uid    = user["id"]
-                flow   = user.get("flow", "")
-                st     = ob.get("streamSettings", {})
-                net    = st.get("network", "tcp")
-                sec    = st.get("security", "")
+                vnext = ob["settings"]["vnext"][0]
+                addr, port = vnext["address"], vnext["port"]
+                uid  = vnext["users"][0]["id"]
+                flow = vnext["users"][0].get("flow", "")
+                st   = ob.get("streamSettings", {})
+                net, sec = st.get("network", "tcp"), st.get("security", "")
                 sni = pbk = sid = fp = ""
                 if sec == "reality":
                     rs  = st.get("realitySettings", {})
@@ -420,12 +204,12 @@ def _parse_xray_json(text):
                 elif sec == "tls":
                     sni = st.get("tlsSettings", {}).get("serverName", "")
                 p = []
-                if sec:  p.append(f"security={sec}")
-                if sni:  p.append(f"sni={sni}")
-                if pbk:  p.append(f"pbk={pbk}")
-                if sid:  p.append(f"sid={sid}")
-                if fp:   p.append(f"fp={fp}")
-                if flow: p.append(f"flow={flow}")
+                if sec: p.append(f"security={sec}")
+                if sni: p.append(f"sni={sni}")
+                if pbk: p.append(f"pbk={pbk}")
+                if sid: p.append(f"sid={sid}")
+                if fp:  p.append(f"fp={fp}")
+                if flow:p.append(f"flow={flow}")
                 p.append(f"type={net}")
                 uris.append(f"vless://{uid}@{addr}:{port}?{'&'.join(p)}#from-json")
             except (KeyError, IndexError, TypeError):
@@ -445,7 +229,7 @@ def extract_uris(text):
     if '"outbounds"' in text and '"protocol"' in text:
         uris.extend(_parse_xray_json(text))
     for m in re.finditer(
-        r"(?:^|\s)(vless|vmess|trojan)://[^\s]+",
+        r"(?:^|\s)(vless|vmess|trojan|ss)://[^\s]+",
         text, re.I | re.M,
     ):
         uris.append(m.group(0).strip())
@@ -470,10 +254,19 @@ def _parse_vless(uri):
     host_hdr = q.get("host", [""])[0]
     svc      = q.get("serviceName", [""])[0]
 
+    # Жёсткая проверка Reality — все поля обязательны
+    if sec == "reality" and (not pbk or not sni or not fp):
+        return None
+
+    # Жёсткая проверка gRPC — serviceName обязателен
+    if net == "grpc" and not svc:
+        return None
+
     stream = {"network": net}
     if sec == "tls":
+        # ⚠ Без allowInsecure — Xray валидирует сертификат как реальный клиент
         stream["security"]    = "tls"
-        stream["tlsSettings"] = {"serverName": sni or host, "allowInsecure": True}
+        stream["tlsSettings"] = {"serverName": sni or host}
     elif sec == "reality":
         stream["security"]        = "reality"
         stream["realitySettings"] = {
@@ -496,27 +289,40 @@ def _parse_vless(uri):
 
 
 def _parse_vmess(uri):
-    b64 = uri[8:]
-    pad = "=" * (-len(b64) % 4)
-    d   = json.loads(base64.b64decode(b64 + pad).decode("utf-8"))
-    host = d["add"]
-    port = int(d["port"])
+    try:
+        b64 = uri[8:]
+        pad = "=" * (-len(b64) % 4)
+        d   = json.loads(base64.b64decode(b64 + pad).decode("utf-8"))
+    except Exception:
+        return None
+    host = d.get("add")
+    port = d.get("port")
+    if not (host and port):
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
     net  = d.get("net", "tcp")
     tls  = d.get("tls", "")
     sni  = d.get("sni", "") or d.get("host", "")
     path = d.get("path", "/")
     hh   = d.get("host", "")
+    svc  = d.get("path", "") if net == "grpc" else ""
+
+    if net == "grpc" and not svc:
+        return None
 
     stream = {"network": net}
     if tls:
         stream["security"]    = "tls"
-        stream["tlsSettings"] = {"serverName": sni or host, "allowInsecure": True}
+        stream["tlsSettings"] = {"serverName": sni or host}   # без allowInsecure
     else:
         stream["security"] = "none"
     if net == "ws":
         stream["wsSettings"] = {"path": path, "headers": {"Host": hh or host}}
     elif net == "grpc":
-        stream["grpcSettings"] = {"serviceName": path}
+        stream["grpcSettings"] = {"serviceName": svc}
 
     return {
         "protocol": "vmess",
@@ -539,12 +345,18 @@ def _parse_trojan(uri):
     net  = q.get("type", ["tcp"])[0]
     path = q.get("path", ["/"])[0]
     hh   = q.get("host", [""])[0]
+    svc  = q.get("serviceName", [""])[0]
+
+    if net == "grpc" and not svc:
+        return None
 
     stream = {"network": net, "security": sec}
     if sec == "tls":
-        stream["tlsSettings"] = {"serverName": sni, "allowInsecure": True}
+        stream["tlsSettings"] = {"serverName": sni}   # без allowInsecure
     if net == "ws":
         stream["wsSettings"] = {"path": path, "headers": {"Host": hh or host}}
+    elif net == "grpc":
+        stream["grpcSettings"] = {"serviceName": svc}
 
     return {
         "protocol": "trojan",
@@ -553,11 +365,59 @@ def _parse_trojan(uri):
     }
 
 
+def _parse_ss(uri):
+    """ss://base64(method:pass)@host:port#name  или  ss://base64(method:pass@host:port)#name"""
+    try:
+        body = uri[5:].split("#", 1)[0]
+        if "@" in body:
+            userinfo, hostpart = body.rsplit("@", 1)
+            try:
+                userinfo = base64.b64decode(_fix_b64(userinfo)).decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            if ":" not in userinfo:
+                return None
+            method, password = userinfo.split(":", 1)
+            hostpart = hostpart.split("?", 1)[0].split("/", 1)[0]
+            if ":" not in hostpart:
+                return None
+            host, port_s = hostpart.rsplit(":", 1)
+            try:
+                port = int(port_s)
+            except ValueError:
+                return None
+        else:
+            decoded = base64.b64decode(_fix_b64(body)).decode("utf-8", errors="ignore")
+            if "@" not in decoded:
+                return None
+            userinfo, hostpart = decoded.rsplit("@", 1)
+            if ":" not in userinfo or ":" not in hostpart:
+                return None
+            method, password = userinfo.split(":", 1)
+            host, port_s = hostpart.rsplit(":", 1)
+            try:
+                port = int(port_s)
+            except ValueError:
+                return None
+    except Exception:
+        return None
+
+    return {
+        "protocol": "shadowsocks",
+        "settings": {"servers": [{
+            "address": host, "port": port,
+            "method": method, "password": password,
+        }]},
+        "streamSettings": {"network": "tcp", "security": "none"},
+    }
+
+
 def uri_to_outbound(uri):
     try:
         if uri.startswith("vless://"):  return _parse_vless(uri)
         if uri.startswith("vmess://"):  return _parse_vmess(uri)
         if uri.startswith("trojan://"): return _parse_trojan(uri)
+        if uri.startswith("ss://"):     return _parse_ss(uri)
     except Exception:
         return None
     return None
@@ -570,17 +430,13 @@ def extract_host_port(outbound):
         if proto in ("vless", "vmess"):
             v = s["vnext"][0]
             return v["address"], int(v["port"])
-        if proto == "trojan":
+        if proto in ("trojan", "shadowsocks"):
             v = s["servers"][0]
             return v["address"], int(v["port"])
     except (KeyError, IndexError, TypeError, ValueError):
         pass
     return None, None
 
-
-# ============================================================
-#  GeoIP (ip-api.com, batch)
-# ============================================================
 
 def resolve_ips(hosts):
     out = {}
@@ -612,8 +468,7 @@ def geo_lookup(ips):
             with urlopen(req, timeout=15) as r:
                 data = json.loads(r.read())
             for item in data:
-                q  = item.get("query")
-                cc = item.get("countryCode")
+                q, cc = item.get("query"), item.get("countryCode")
                 if q and cc:
                     result[q] = cc
         except Exception as e:
@@ -621,10 +476,6 @@ def geo_lookup(ips):
         time.sleep(0.5)
     return result
 
-
-# ============================================================
-#  Xray + тест
-# ============================================================
 
 def ensure_xray(root: Path):
     xray_dir = root / "xray"
@@ -661,26 +512,34 @@ def tcp_check(host, port, timeout=TCP_CHECK_TIMEOUT):
         return False
 
 
-def _ping_via_socks(port):
-    secs = int(REQUEST_TIMEOUT_MS / 1000) or 3
+def _single_curl(port):
+    secs = int(REQUEST_TIMEOUT_MS / 1000) or 4
+    start = time.time()
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "--socks5-hostname", f"127.0.0.1:{port}",
+             "--connect-timeout", str(secs),
+             "--max-time", str(secs),
+             TEST_URL],
+            capture_output=True, text=True,
+            timeout=secs + 2,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if r.stdout.strip() in ("200", "204"):
+        return (time.time() - start) * 1000
+    return None
+
+
+def _run_xray_and_measure(xray_bin, xray_dir, cfg_path, port):
+    """Возвращает список успешных пингов из PING_ATTEMPTS попыток."""
     pings = []
     for _ in range(PING_ATTEMPTS):
-        start = time.time()
-        try:
-            r = subprocess.run(
-                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                 "--socks5-hostname", f"127.0.0.1:{port}",
-                 "--connect-timeout", str(secs),
-                 "--max-time", str(secs),
-                 TEST_URL],
-                capture_output=True, text=True,
-                timeout=secs + 2,
-            )
-        except subprocess.TimeoutExpired:
-            continue
-        if r.stdout.strip() in ("200", "204"):
-            pings.append((time.time() - start) * 1000)
-    return min(pings) if pings else None
+        p = _single_curl(port)
+        if p is not None:
+            pings.append(p)
+    return pings
 
 
 def test_one(xray_bin, xray_dir, outbound):
@@ -705,7 +564,7 @@ def test_one(xray_bin, xray_dir, outbound):
             [str(xray_bin), "run", "-c", cfg_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
-        deadline = time.time() + 3.0
+        deadline = time.time() + 4.0
         started = False
         while time.time() < deadline:
             if proc.poll() is not None:
@@ -718,7 +577,24 @@ def test_one(xray_bin, xray_dir, outbound):
                 time.sleep(0.05)
         if not started:
             return None
-        return _ping_via_socks(port)
+
+        # Первичный тест: PING_ATTEMPTS попыток
+        pings = _run_xray_and_measure(xray_bin, xray_dir, cfg_path, port)
+        if len(pings) < MIN_SUCCESS:
+            return None
+
+        first_ok = min(pings)
+
+        # Контрольный повтор через STABILITY_WAIT — конфиг должен ещё жить
+        time.sleep(STABILITY_WAIT)
+        if proc.poll() is not None:
+            return None    # Xray упал за время паузы
+        p2 = _single_curl(port)
+        if p2 is None:
+            return None
+
+        # Итоговый пинг = среднее из минимального и повторного
+        return (first_ok + p2) / 2
     except Exception:
         return None
     finally:
@@ -739,15 +615,10 @@ def rename_config(uri, idx, code):
     return f"{uri.split('#', 1)[0]}#{flag} {name} {idx:02d} TEMIDA PARS"
 
 
-# ============================================================
-#  MAIN
-# ============================================================
-
 def main():
     root = Path("./")
     xray_bin, xray_dir = ensure_xray(root)
 
-    # 1. Сбор URI
     all_uris = []
     for src in SOURCES:
         print(f"[*] {src[:70]}...")
@@ -768,20 +639,20 @@ def main():
     if not uniq:
         print("[ERROR] Нет конфигов", file=sys.stderr); sys.exit(1)
 
-    # 2. Парсинг
     parsed = []
+    parse_fail = 0
     for u in uniq:
         ob = uri_to_outbound(u)
         if not ob:
+            parse_fail += 1
             continue
         h, p = extract_host_port(ob)
         if h and p:
             parsed.append((u, ob, h, p))
-    print(f"[*] Распарсено: {len(parsed)}")
+    print(f"[*] Распарсено: {len(parsed)} (не распарсено: {parse_fail})")
     if not parsed:
         print("[ERROR] Ничего не распарсено", file=sys.stderr); sys.exit(1)
 
-    # 3. Резолв + GeoIP
     print("[*] Резолвлю IP-адреса серверов...")
     hosts = {h for _, _, h, _ in parsed}
     host_to_ip = resolve_ips(hosts)
@@ -791,12 +662,8 @@ def main():
     ip_to_cc = geo_lookup(host_to_ip.values())
     print(f"    гео найдено для {len(ip_to_cc)} IP")
 
-    host_to_cc = {}
-    for h, ip in host_to_ip.items():
-        if ip in ip_to_cc:
-            host_to_cc[h] = ip_to_cc[ip]
+    host_to_cc = {h: ip_to_cc[ip] for h, ip in host_to_ip.items() if ip in ip_to_cc}
 
-    # 4. TCP pre-check
     print(f"[*] TCP-проверка host:port (timeout {TCP_CHECK_TIMEOUT}s, потоков {WORKERS})...")
     alive = []
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -808,9 +675,8 @@ def main():
     if not alive:
         print("[ERROR] Ни один сервер не отвечает по TCP", file=sys.stderr); sys.exit(1)
 
-    # 5. Полный тест
-    print(f"[*] Реальный тест: max-time={REQUEST_TIMEOUT_MS}ms, "
-          f"attempts={PING_ATTEMPTS}, фильтр <= {PING_LIMIT_MS}ms")
+    print(f"[*] Строгий тест: {PING_ATTEMPTS} попыток, нужно ≥{MIN_SUCCESS}, "
+          f"пауза {STABILITY_WAIT}s + контрольный повтор, фильтр ≤{PING_LIMIT_MS}ms")
     results = []
     any_ok = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -828,14 +694,13 @@ def main():
                 any_ok += 1
                 if ping <= PING_LIMIT_MS:
                     results.append((u, h, ping))
-            if done % 50 == 0:
-                print(f"    [{done}/{len(alive)}] рабочих: {len(results)} "
-                      f"(успешных ответов: {any_ok})")
+            if done % 25 == 0:
+                print(f"    [{done}/{len(alive)}] прошли строгий тест: {len(results)} "
+                      f"(успешных вообще: {any_ok})")
 
-    print(f"[*] Успешных ответов всего: {any_ok}")
-    print(f"[*] Из них <= {PING_LIMIT_MS} мс: {len(results)}")
+    print(f"[*] Успешных после строгого теста: {any_ok}")
+    print(f"[*] Из них ≤ {PING_LIMIT_MS} мс: {len(results)}")
 
-    # 6. Сортировка + переименование
     results.sort(key=lambda x: x[2])
     renamed = [rename_config(u, i, host_to_cc.get(h, ""))
                for i, (u, h, _) in enumerate(results, 1)]
