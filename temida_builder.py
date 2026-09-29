@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Temida Parser — сбор, тест и переименование V2Ray-конфигов."""
+"""Temida Parser — сбор, реальный замер пинга и гео-флагов конфигов."""
 
 import os, io, re, sys, json, time, base64, socket, zipfile, tempfile, subprocess
 from pathlib import Path
@@ -9,6 +9,7 @@ from urllib.parse import urlparse, urlunparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+# ---------- flagz (необязательный, для англ. фолбэка) ----------
 def _ensure_pip():
     try:
         __import__("flagz")
@@ -24,6 +25,7 @@ except ImportError:
     HAS_FLAGZ = False
 
 
+# ---------- настройки ----------
 SOURCES = [
     "https://raw.githubusercontent.com/igctndd-hub/LikeVPN/refs/heads/main/LikeVPN.txt",
     "https://raw.githubusercontent.com/topgee-lab/topgee17/refs/heads/main/parsing",
@@ -36,17 +38,310 @@ SOURCES = [
     "https://github.com/terik21/HiddifySubs-VlessKeys/raw/refs/heads/main/WhiteKeys",
 ]
 
-MAX_PING_MS    = 250
-OUTPUT_FILE    = "temida.txt"
-TEST_URL       = "http://www.gstatic.com/generate_204"
-FETCH_TIMEOUT  = 30
-WORKERS        = 20
-XRAY_URL       = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+OUTPUT_FILE        = "temida.txt"
+TEST_URL           = "http://www.gstatic.com/generate_204"
+REQUEST_TIMEOUT_MS = 3000
+PING_LIMIT_MS      = 250
+PING_ATTEMPTS      = 2
+TCP_CHECK_TIMEOUT  = 3.0
+WORKERS            = 20
+FETCH_TIMEOUT      = 30
+XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
 
 URI_RE       = re.compile(r"^(vless|vmess|trojan)://", re.I)
 FLAG_RE      = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
 B64_BLOCK_RE = re.compile(r"base64:([A-Za-z0-9+/=]+)")
 
+
+# ============================================================
+#  ПОЛНЫЙ СЛОВАРЬ СТРАН (ISO 3166-1 alpha-2 → русское название)
+# ============================================================
+
+RU_COUNTRIES = {
+    "AD": "Андорра",
+    "AE": "ОАЭ",
+    "AF": "Афганистан",
+    "AG": "Антигуа и Барбуда",
+    "AI": "Ангилья",
+    "AL": "Албания",
+    "AM": "Армения",
+    "AO": "Ангола",
+    "AQ": "Антарктида",
+    "AR": "Аргентина",
+    "AS": "Американское Самоа",
+    "AT": "Австрия",
+    "AU": "Австралия",
+    "AW": "Аруба",
+    "AX": "Аландские острова",
+    "AZ": "Азербайджан",
+    "BA": "Босния и Герцеговина",
+    "BB": "Барбадос",
+    "BD": "Бангладеш",
+    "BE": "Бельгия",
+    "BF": "Буркина-Фасо",
+    "BG": "Болгария",
+    "BH": "Бахрейн",
+    "BI": "Бурунди",
+    "BJ": "Бенин",
+    "BL": "Сен-Бартелеми",
+    "BM": "Бермуды",
+    "BN": "Бруней",
+    "BO": "Боливия",
+    "BQ": "Бонайре",
+    "BR": "Бразилия",
+    "BS": "Багамы",
+    "BT": "Бутан",
+    "BV": "Остров Буве",
+    "BW": "Ботсвана",
+    "BY": "Беларусь",
+    "BZ": "Белиз",
+    "CA": "Канада",
+    "CC": "Кокосовые острова",
+    "CD": "Конго (ДРК)",
+    "CF": "ЦАР",
+    "CG": "Конго",
+    "CH": "Швейцария",
+    "CI": "Кот-д’Ивуар",
+    "CK": "Острова Кука",
+    "CL": "Чили",
+    "CM": "Камерун",
+    "CN": "Китай",
+    "CO": "Колумбия",
+    "CR": "Коста-Рика",
+    "CU": "Куба",
+    "CV": "Кабо-Верде",
+    "CW": "Кюрасао",
+    "CX": "Остров Рождества",
+    "CY": "Кипр",
+    "CZ": "Чехия",
+    "DE": "Германия",
+    "DJ": "Джибути",
+    "DK": "Дания",
+    "DM": "Доминика",
+    "DO": "Доминикана",
+    "DZ": "Алжир",
+    "EC": "Эквадор",
+    "EE": "Эстония",
+    "EG": "Египет",
+    "EH": "Западная Сахара",
+    "ER": "Эритрея",
+    "ES": "Испания",
+    "ET": "Эфиопия",
+    "FI": "Финляндия",
+    "FJ": "Фиджи",
+    "FK": "Фолкленды",
+    "FM": "Микронезия",
+    "FO": "Фареры",
+    "FR": "Франция",
+    "GA": "Габон",
+    "GB": "Великобритания",
+    "GD": "Гренада",
+    "GE": "Грузия",
+    "GF": "Французская Гвиана",
+    "GG": "Гернси",
+    "GH": "Гана",
+    "GI": "Гибралтар",
+    "GL": "Гренландия",
+    "GM": "Гамбия",
+    "GN": "Гвинея",
+    "GP": "Гваделупа",
+    "GQ": "Экваториальная Гвинея",
+    "GR": "Греция",
+    "GS": "Южная Георгия",
+    "GT": "Гватемала",
+    "GU": "Гуам",
+    "GW": "Гвинея-Бисау",
+    "GY": "Гайана",
+    "HK": "Гонконг",
+    "HM": "Остров Херд",
+    "HN": "Гондурас",
+    "HR": "Хорватия",
+    "HT": "Гаити",
+    "HU": "Венгрия",
+    "ID": "Индонезия",
+    "IE": "Ирландия",
+    "IL": "Израиль",
+    "IM": "Остров Мэн",
+    "IN": "Индия",
+    "IO": "Британская территория в Индийском океане",
+    "IQ": "Ирак",
+    "IR": "Иран",
+    "IS": "Исландия",
+    "IT": "Италия",
+    "JE": "Джерси",
+    "JM": "Ямайка",
+    "JO": "Иордания",
+    "JP": "Япония",
+    "KE": "Кения",
+    "KG": "Кыргызстан",
+    "KH": "Камбоджа",
+    "KI": "Кирибати",
+    "KM": "Коморы",
+    "KN": "Сент-Китс и Невис",
+    "KP": "КНДР",
+    "KR": "Южная Корея",
+    "KW": "Кувейт",
+    "KY": "Каймановы острова",
+    "KZ": "Казахстан",
+    "LA": "Лаос",
+    "LB": "Ливан",
+    "LC": "Сент-Люсия",
+    "LI": "Лихтенштейн",
+    "LK": "Шри-Ланка",
+    "LR": "Либерия",
+    "LS": "Лесото",
+    "LT": "Литва",
+    "LU": "Люксембург",
+    "LV": "Латвия",
+    "LY": "Ливия",
+    "MA": "Марокко",
+    "MC": "Монако",
+    "MD": "Молдова",
+    "ME": "Черногория",
+    "MF": "Сен-Мартен",
+    "MG": "Мадагаскар",
+    "MH": "Маршалловы Острова",
+    "MK": "Северная Македония",
+    "ML": "Мали",
+    "MM": "Мьянма",
+    "MN": "Монголия",
+    "MO": "Макао",
+    "MP": "Северные Марианские острова",
+    "MQ": "Мартиника",
+    "MR": "Мавритания",
+    "MS": "Монтсеррат",
+    "MT": "Мальта",
+    "MU": "Маврикий",
+    "MV": "Мальдивы",
+    "MW": "Малави",
+    "MX": "Мексика",
+    "MY": "Малайзия",
+    "MZ": "Мозамбик",
+    "NA": "Намибия",
+    "NC": "Новая Каледония",
+    "NE": "Нигер",
+    "NF": "Остров Норфолк",
+    "NG": "Нигерия",
+    "NI": "Никарагуа",
+    "NL": "Нидерланды",
+    "NO": "Норвегия",
+    "NP": "Непал",
+    "NR": "Науру",
+    "NU": "Ниуэ",
+    "NZ": "Новая Зеландия",
+    "OM": "Оман",
+    "PA": "Панама",
+    "PE": "Перу",
+    "PF": "Французская Полинезия",
+    "PG": "Папуа — Новая Гвинея",
+    "PH": "Филиппины",
+    "PK": "Пакистан",
+    "PL": "Польша",
+    "PM": "Сен-Пьер и Микелон",
+    "PN": "Питкэрн",
+    "PR": "Пуэрто-Рико",
+    "PS": "Палестина",
+    "PT": "Португалия",
+    "PW": "Палау",
+    "PY": "Парагвай",
+    "QA": "Катар",
+    "RE": "Реюньон",
+    "RO": "Румыния",
+    "RS": "Сербия",
+    "RU": "Россия",
+    "RW": "Руанда",
+    "SA": "Саудовская Аравия",
+    "SB": "Соломоновы Острова",
+    "SC": "Сейшелы",
+    "SD": "Судан",
+    "SE": "Швеция",
+    "SG": "Сингапур",
+    "SH": "Остров Святой Елены",
+    "SI": "Словения",
+    "SJ": "Шпицберген и Ян-Майен",
+    "SK": "Словакия",
+    "SL": "Сьерра-Леоне",
+    "SM": "Сан-Марино",
+    "SN": "Сенегал",
+    "SO": "Сомали",
+    "SR": "Суринам",
+    "SS": "Южный Судан",
+    "ST": "Сан-Томе и Принсипи",
+    "SV": "Сальвадор",
+    "SX": "Синт-Мартен",
+    "SY": "Сирия",
+    "SZ": "Эсватини",
+    "TC": "Тёркс и Кайкос",
+    "TD": "Чад",
+    "TF": "Французские Южные территории",
+    "TG": "Того",
+    "TH": "Таиланд",
+    "TJ": "Таджикистан",
+    "TK": "Токелау",
+    "TL": "Восточный Тимор",
+    "TM": "Туркменистан",
+    "TN": "Тунис",
+    "TO": "Тонга",
+    "TR": "Турция",
+    "TT": "Тринидад и Тобаго",
+    "TV": "Тувалу",
+    "TW": "Тайвань",
+    "TZ": "Танзания",
+    "UA": "Украина",
+    "UG": "Уганда",
+    "UM": "Внешние малые острова США",
+    "US": "США",
+    "UY": "Уругвай",
+    "UZ": "Узбекистан",
+    "VA": "Ватикан",
+    "VC": "Сент-Винсент и Гренадины",
+    "VE": "Венесуэла",
+    "VG": "Британские Виргинские острова",
+    "VI": "Виргинские Острова США",
+    "VN": "Вьетнам",
+    "VU": "Вануату",
+    "WF": "Уоллис и Футуна",
+    "WS": "Самоа",
+    "XK": "Косово",
+    "YE": "Йемен",
+    "YT": "Майотта",
+    "ZA": "ЮАР",
+    "ZM": "Замбия",
+    "ZW": "Зимбабве",
+}
+
+
+# ============================================================
+#  ФЛАГИ И НАЗВАНИЯ
+# ============================================================
+
+def code_to_flag(code):
+    if not code or len(code) != 2:
+        return "\U0001F310"
+    return "".join(chr(ord(c) + 0x1F1E6 - ord("A")) for c in code.upper())
+
+
+def country_info(code):
+    """'BY' → ('🇧🇾', 'Беларусь'). Фолбэки: словарь → flagz → код."""
+    code = (code or "").upper()
+    if len(code) != 2 or not code.isalpha():
+        return "\U0001F310", "Unknown"
+
+    flag = code_to_flag(code)
+    name = RU_COUNTRIES.get(code)
+    if name:
+        return flag, name
+    if HAS_FLAGZ:
+        try:
+            return flag, flagz.by_code(code).name
+        except Exception:
+            pass
+    return flag, code
+
+
+# ============================================================
+#  URL-энкодинг и загрузка
+# ============================================================
 
 def _encode_url(url: str) -> str:
     p = urlparse(url)
@@ -74,6 +369,10 @@ def fetch_url(url: str):
         return None
 
 
+# ============================================================
+#  Base64 / Xray-JSON / URI-парсеры
+# ============================================================
+
 def _fix_b64(s):
     s = s.strip().replace("\n", "").replace("\r", "")
     m = len(s) % 4
@@ -93,7 +392,6 @@ def _try_b64(text):
 
 def _parse_xray_json(text):
     uris = []
-    # ⚠ ИСПРАВЛЕНО: закрывающая ' после "  (было `[,}]"` — открывало неопределённую строку)
     for m in re.finditer(r'"outbounds"\s*:\s*(\[.*?\])\s*[,}]', text, re.DOTALL):
         try:
             obs = json.loads(m.group(1))
@@ -265,6 +563,69 @@ def uri_to_outbound(uri):
     return None
 
 
+def extract_host_port(outbound):
+    proto = outbound.get("protocol")
+    s     = outbound.get("settings", {})
+    try:
+        if proto in ("vless", "vmess"):
+            v = s["vnext"][0]
+            return v["address"], int(v["port"])
+        if proto == "trojan":
+            v = s["servers"][0]
+            return v["address"], int(v["port"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        pass
+    return None, None
+
+
+# ============================================================
+#  GeoIP (ip-api.com, batch)
+# ============================================================
+
+def resolve_ips(hosts):
+    out = {}
+    def _one(h):
+        try:
+            return h, socket.gethostbyname(h)
+        except Exception:
+            return h, None
+    with ThreadPoolExecutor(max_workers=50) as ex:
+        for h, ip in ex.map(_one, hosts):
+            if ip:
+                out[h] = ip
+    return out
+
+
+def geo_lookup(ips):
+    ips = list({ip for ip in ips if ip})
+    result = {}
+    for i in range(0, len(ips), 100):
+        chunk = ips[i:i + 100]
+        payload = [{"query": ip, "fields": "query,countryCode"} for ip in chunk]
+        try:
+            req = Request(
+                "http://ip-api.com/batch?fields=query,countryCode",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+            for item in data:
+                q  = item.get("query")
+                cc = item.get("countryCode")
+                if q and cc:
+                    result[q] = cc
+        except Exception as e:
+            print(f"[WARN] geo batch {i//100}: {e}", file=sys.stderr)
+        time.sleep(0.5)
+    return result
+
+
+# ============================================================
+#  Xray + тест
+# ============================================================
+
 def ensure_xray(root: Path):
     xray_dir = root / "xray"
     xray_bin = xray_dir / "xray"
@@ -282,7 +643,7 @@ def ensure_xray(root: Path):
         first = (v.stdout or v.stderr).splitlines()
         print(f"    Xray: {first[0] if first else 'OK'}")
     except Exception as e:
-        print(f"    [!] Не удалось получить версию Xray: {e}")
+        print(f"    [!] version: {e}")
     return xray_bin, xray_dir
 
 
@@ -292,7 +653,37 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def test_one(xray_bin, xray_dir, outbound, timeout_ms):
+def tcp_check(host, port, timeout=TCP_CHECK_TIMEOUT):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ping_via_socks(port):
+    secs = int(REQUEST_TIMEOUT_MS / 1000) or 3
+    pings = []
+    for _ in range(PING_ATTEMPTS):
+        start = time.time()
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "--socks5-hostname", f"127.0.0.1:{port}",
+                 "--connect-timeout", str(secs),
+                 "--max-time", str(secs),
+                 TEST_URL],
+                capture_output=True, text=True,
+                timeout=secs + 2,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if r.stdout.strip() in ("200", "204"):
+            pings.append((time.time() - start) * 1000)
+    return min(pings) if pings else None
+
+
+def test_one(xray_bin, xray_dir, outbound):
     port = _free_port()
     cfg = {
         "log": {"loglevel": "none"},
@@ -314,7 +705,6 @@ def test_one(xray_bin, xray_dir, outbound, timeout_ms):
             [str(xray_bin), "run", "-c", cfg_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
-
         deadline = time.time() + 3.0
         started = False
         while time.time() < deadline:
@@ -328,24 +718,7 @@ def test_one(xray_bin, xray_dir, outbound, timeout_ms):
                 time.sleep(0.05)
         if not started:
             return None
-
-        start = time.time()
-        try:
-            r = subprocess.run(
-                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                 "--socks5-hostname", f"127.0.0.1:{port}",
-                 "--connect-timeout", "3",
-                 "--max-time", f"{timeout_ms/1000:.2f}",
-                 TEST_URL],
-                capture_output=True, text=True,
-                timeout=timeout_ms / 1000 + 2,
-            )
-        except subprocess.TimeoutExpired:
-            return None
-        elapsed = (time.time() - start) * 1000
-        if r.stdout.strip() in ("200", "204"):
-            return elapsed
-        return None
+        return _ping_via_socks(port)
     except Exception:
         return None
     finally:
@@ -361,33 +734,20 @@ def test_one(xray_bin, xray_dir, outbound, timeout_ms):
             pass
 
 
-def extract_flag(t):
-    m = FLAG_RE.search(t or "")
-    return m.group(0) if m else None
+def rename_config(uri, idx, code):
+    flag, name = country_info(code)
+    return f"{uri.split('#', 1)[0]}#{flag} {name} {idx:02d} TEMIDA PARS"
 
 
-def flag_to_country(flag):
-    if not HAS_FLAGZ or not flag:
-        return None
-    try:
-        code = "".join(chr(ord(c) - 0x1F1E6 + ord("A")) for c in flag)
-        return flagz.by_code(code).name
-    except Exception:
-        return None
-
-
-def rename_config(uri, idx):
-    flag    = extract_flag(uri)
-    country = flag_to_country(flag) if flag else None
-    name    = f"{flag} {country} {idx:02d} TEMIDA PARS" if country \
-              else f"\U0001F310 Unknown {idx:02d} TEMIDA PARS"
-    return f"{uri.split('#', 1)[0]}#{name}"
-
+# ============================================================
+#  MAIN
+# ============================================================
 
 def main():
     root = Path("./")
     xray_bin, xray_dir = ensure_xray(root)
 
+    # 1. Сбор URI
     all_uris = []
     for src in SOURCES:
         print(f"[*] {src[:70]}...")
@@ -396,51 +756,89 @@ def main():
             print("    -> пропущен")
             continue
         found = extract_uris(t)
-        print(f"    -> {len(found)} URI (получено {len(t)} байт)")
+        print(f"    -> {len(found)} URI")
         all_uris.extend(found)
 
     seen, uniq = set(), []
     for u in all_uris:
         k = u.split("#", 1)[0]
         if k not in seen:
-            seen.add(k)
-            uniq.append(u)
+            seen.add(k); uniq.append(u)
     print(f"[*] Уникальных URI: {len(uniq)}")
     if not uniq:
-        print("[ERROR] Нет конфигов", file=sys.stderr)
-        sys.exit(1)
+        print("[ERROR] Нет конфигов", file=sys.stderr); sys.exit(1)
 
-    tasks = []
+    # 2. Парсинг
+    parsed = []
     for u in uniq:
         ob = uri_to_outbound(u)
-        if ob:
-            tasks.append((u, ob))
-    print(f"[*] Распарсено: {len(tasks)}")
-    if not tasks:
-        print("[ERROR] Ни один URI не распарсен", file=sys.stderr)
-        sys.exit(1)
+        if not ob:
+            continue
+        h, p = extract_host_port(ob)
+        if h and p:
+            parsed.append((u, ob, h, p))
+    print(f"[*] Распарсено: {len(parsed)}")
+    if not parsed:
+        print("[ERROR] Ничего не распарсено", file=sys.stderr); sys.exit(1)
 
-    print(f"[*] Тестирую: потоков={WORKERS}, лимит={MAX_PING_MS} мс, URL={TEST_URL}")
-    results = []
+    # 3. Резолв + GeoIP
+    print("[*] Резолвлю IP-адреса серверов...")
+    hosts = {h for _, _, h, _ in parsed}
+    host_to_ip = resolve_ips(hosts)
+    print(f"    разрезолвлено {len(host_to_ip)} из {len(hosts)}")
+
+    print("[*] Определяю страны через ip-api.com...")
+    ip_to_cc = geo_lookup(host_to_ip.values())
+    print(f"    гео найдено для {len(ip_to_cc)} IP")
+
+    host_to_cc = {}
+    for h, ip in host_to_ip.items():
+        if ip in ip_to_cc:
+            host_to_cc[h] = ip_to_cc[ip]
+
+    # 4. TCP pre-check
+    print(f"[*] TCP-проверка host:port (timeout {TCP_CHECK_TIMEOUT}s, потоков {WORKERS})...")
+    alive = []
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futures = {ex.submit(test_one, xray_bin, xray_dir, ob, MAX_PING_MS): u
-                   for u, ob in tasks}
+        futs = {ex.submit(tcp_check, h, p): (u, ob, h, p) for u, ob, h, p in parsed}
+        for f in as_completed(futs):
+            if f.result():
+                alive.append(futs[f])
+    print(f"    TCP-reachable: {len(alive)} / {len(parsed)}")
+    if not alive:
+        print("[ERROR] Ни один сервер не отвечает по TCP", file=sys.stderr); sys.exit(1)
+
+    # 5. Полный тест
+    print(f"[*] Реальный тест: max-time={REQUEST_TIMEOUT_MS}ms, "
+          f"attempts={PING_ATTEMPTS}, фильтр <= {PING_LIMIT_MS}ms")
+    results = []
+    any_ok = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(test_one, xray_bin, xray_dir, ob): (u, h)
+                for u, ob, h, _ in alive}
         done = 0
-        for fut in as_completed(futures):
+        for f in as_completed(futs):
             done += 1
-            u = futures[fut]
+            u, h = futs[f]
             try:
-                ping = fut.result()
+                ping = f.result()
             except Exception:
                 ping = None
-            if ping is not None and ping <= MAX_PING_MS:
-                results.append((u, ping))
+            if ping is not None:
+                any_ok += 1
+                if ping <= PING_LIMIT_MS:
+                    results.append((u, h, ping))
             if done % 50 == 0:
-                print(f"    [{done}/{len(tasks)}] рабочих: {len(results)}")
+                print(f"    [{done}/{len(alive)}] рабочих: {len(results)} "
+                      f"(успешных ответов: {any_ok})")
 
-    print(f"[*] Рабочих <= {MAX_PING_MS} мс: {len(results)}")
-    results.sort(key=lambda x: x[1])
-    renamed = [rename_config(u, i) for i, (u, _) in enumerate(results, 1)]
+    print(f"[*] Успешных ответов всего: {any_ok}")
+    print(f"[*] Из них <= {PING_LIMIT_MS} мс: {len(results)}")
+
+    # 6. Сортировка + переименование
+    results.sort(key=lambda x: x[2])
+    renamed = [rename_config(u, i, host_to_cc.get(h, ""))
+               for i, (u, h, _) in enumerate(results, 1)]
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(renamed))
